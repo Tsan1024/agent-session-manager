@@ -285,6 +285,15 @@ def _read_stdin(stdin_cache: list[str | None]) -> str:
     return stdin_cache[0]
 
 
+def _derive_title_from_summary(summary: str) -> str:
+    words = summary.replace("\n", " ").split()
+    return " ".join(words[:6]).strip() or "Untitled Session"
+
+
+def _derive_goal_from_summary(summary: str) -> str:
+    return summary.strip()
+
+
 def _handle_codex_hook(registry: Registry, payload: dict[str, object]) -> int:
     event_name = str(payload.get("hook_event_name"))
     session_ref = str(payload.get("session_id"))
@@ -303,17 +312,24 @@ def _handle_codex_hook(registry: Registry, payload: dict[str, object]) -> int:
         session_id = registry.touch_session_by_agent_ref("codex", session_ref)
         last_assistant_message = payload.get("last_assistant_message")
         if isinstance(last_assistant_message, str) and last_assistant_message.strip():
+            summary = last_assistant_message.strip()
             if registry.session_has_checkpoints(session_id):
-                registry.add_checkpoint(
-                    session_id,
-                    "final",
-                    CheckpointPayload(
-                        summary=last_assistant_message.strip(),
-                        completed=[],
-                        blockers=[],
-                        next_actions=[],
-                    ),
+                checkpoint_payload = CheckpointPayload(
+                    summary=summary,
+                    completed=[],
+                    blockers=[],
+                    next_actions=[],
                 )
+            else:
+                checkpoint_payload = CheckpointPayload(
+                    title=_derive_title_from_summary(summary),
+                    goal=_derive_goal_from_summary(summary),
+                    summary=summary,
+                    completed=[],
+                    blockers=[],
+                    next_actions=[],
+                )
+            registry.add_checkpoint(session_id, "final", checkpoint_payload)
         registry.stop_session(session_id)
         print(json.dumps({"continue": True}))
         return 0

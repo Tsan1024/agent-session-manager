@@ -551,6 +551,65 @@ class AsmCliTests(unittest.TestCase):
         self.assertEqual(row[1], "Completed the requested changes and verified the tests pass.")
         self.assertEqual(checkpoint_kinds, ["progress", "final"])
 
+    def test_codex_stop_hook_creates_minimal_final_checkpoint_without_prior_checkpoint(self) -> None:
+        self.run_cli("init")
+
+        start_payload = json.dumps(
+            {
+                "session_id": "codex_auto_minimal",
+                "cwd": str(self.workspace),
+                "hook_event_name": "SessionStart",
+                "source": "startup",
+            }
+        )
+        start = subprocess.run(
+            [sys.executable, "-m", "asm.cli", "codex-hook"],
+            cwd=str(self.workspace),
+            env=self.env,
+            text=True,
+            input=start_payload,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(start.returncode, 0, start.stderr)
+
+        stop_payload = json.dumps(
+            {
+                "session_id": "codex_auto_minimal",
+                "cwd": str(self.workspace),
+                "hook_event_name": "Stop",
+                "turn_id": "turn_minimal",
+                "stop_hook_active": False,
+                "last_assistant_message": "Implemented the IDP plugin changes and updated the wiring.",
+            }
+        )
+        stop = subprocess.run(
+            [sys.executable, "-m", "asm.cli", "codex-hook"],
+            cwd=str(self.workspace),
+            env=self.env,
+            text=True,
+            input=stop_payload,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(stop.returncode, 0, stop.stderr)
+        self.assertEqual(json.loads(stop.stdout), {"continue": True})
+
+        with sqlite3.connect(self.home / "registry.db") as conn:
+            row = conn.execute(
+                "SELECT status, latest_summary, title, goal FROM sessions WHERE agent = ? AND agent_session_ref = ?",
+                ("codex", "codex_auto_minimal"),
+            ).fetchone()
+            checkpoint_rows = conn.execute(
+                "SELECT kind, summary FROM checkpoints WHERE session_id = (SELECT id FROM sessions WHERE agent = ? AND agent_session_ref = ?)",
+                ("codex", "codex_auto_minimal"),
+            ).fetchall()
+        self.assertEqual(row[0], "stopped")
+        self.assertEqual(row[1], "Implemented the IDP plugin changes and updated the wiring.")
+        self.assertIsNotNone(row[2])
+        self.assertIsNotNone(row[3])
+        self.assertEqual(checkpoint_rows, [("final", "Implemented the IDP plugin changes and updated the wiring.")])
+
     def test_current_returns_best_matching_session_for_context(self) -> None:
         self.run_cli("init")
         start = self.run_cli("start", "--agent", "codex", "--agent-session-ref", "sess_current")
