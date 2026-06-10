@@ -472,6 +472,99 @@ class AsmCliTests(unittest.TestCase):
         self.assertEqual(row[1], "stopped")
         self.assertIsNotNone(row[2])
 
+    def test_user_prompt_submit_autofills_title_and_goal_for_clear_task(self) -> None:
+        self.run_cli("init")
+
+        start_payload = json.dumps(
+            {
+                "session_id": "codex_prompt_task",
+                "cwd": str(self.workspace),
+                "hook_event_name": "SessionStart",
+                "source": "startup",
+            }
+        )
+        start = subprocess.run(
+            [sys.executable, "-m", "asm.cli", "codex-hook"],
+            cwd=str(self.workspace),
+            env=self.env,
+            text=True,
+            input=start_payload,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(start.returncode, 0, start.stderr)
+
+        prompt_payload = json.dumps(
+            {
+                "session_id": "codex_prompt_task",
+                "cwd": str(self.workspace),
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "请实现 IDP plugin 的重试逻辑并补上相关测试",
+            }
+        )
+        prompt = subprocess.run(
+            [sys.executable, "-m", "asm.cli", "codex-hook"],
+            cwd=str(self.workspace),
+            env=self.env,
+            text=True,
+            input=prompt_payload,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(prompt.returncode, 0, prompt.stderr)
+
+        with sqlite3.connect(self.home / "registry.db") as conn:
+            row = conn.execute(
+                "SELECT title, goal FROM sessions WHERE agent = ? AND agent_session_ref = ?",
+                ("codex", "codex_prompt_task"),
+            ).fetchone()
+        self.assertIsNotNone(row[0])
+        self.assertIn("IDP plugin", row[1])
+
+    def test_user_prompt_submit_requests_clarification_for_ambiguous_prompt(self) -> None:
+        self.run_cli("init")
+
+        start_payload = json.dumps(
+            {
+                "session_id": "codex_prompt_ambiguous",
+                "cwd": str(self.workspace),
+                "hook_event_name": "SessionStart",
+                "source": "startup",
+            }
+        )
+        start = subprocess.run(
+            [sys.executable, "-m", "asm.cli", "codex-hook"],
+            cwd=str(self.workspace),
+            env=self.env,
+            text=True,
+            input=start_payload,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(start.returncode, 0, start.stderr)
+
+        prompt_payload = json.dumps(
+            {
+                "session_id": "codex_prompt_ambiguous",
+                "cwd": str(self.workspace),
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "继续",
+            }
+        )
+        prompt = subprocess.run(
+            [sys.executable, "-m", "asm.cli", "codex-hook"],
+            cwd=str(self.workspace),
+            env=self.env,
+            text=True,
+            input=prompt_payload,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(prompt.returncode, 0, prompt.stderr)
+        response = json.loads(prompt.stdout)
+        self.assertIn("systemMessage", response)
+        self.assertIn("一句话说明这次要处理的具体任务目标", response["systemMessage"])
+
     def test_codex_stop_hook_writes_auto_final_checkpoint_when_session_has_semantic_context(self) -> None:
         self.run_cli("init")
 
@@ -609,6 +702,73 @@ class AsmCliTests(unittest.TestCase):
         self.assertIsNotNone(row[2])
         self.assertIsNotNone(row[3])
         self.assertEqual(checkpoint_rows, [("final", "Implemented the IDP plugin changes and updated the wiring.")])
+
+    def test_codex_stop_hook_condenses_chatty_message_into_short_summary(self) -> None:
+        self.run_cli("init")
+
+        start_payload = json.dumps(
+            {
+                "session_id": "codex_condense_stop",
+                "cwd": str(self.workspace),
+                "hook_event_name": "SessionStart",
+                "source": "startup",
+            }
+        )
+        start = subprocess.run(
+            [sys.executable, "-m", "asm.cli", "codex-hook"],
+            cwd=str(self.workspace),
+            env=self.env,
+            text=True,
+            input=start_payload,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(start.returncode, 0, start.stderr)
+
+        chatty_message = """请给我具体文档。
+
+可以直接用任一种方式：
+- 发文件路径，比如 `docs/architecture.md`
+- 发文件名，我来在仓库里找
+- 直接贴文档内容
+
+如果你愿意，我会按这个方式帮你理解：
+- 先讲这份文档在说什么
+- 再拆核心概念和术语
+- 再梳理流程/架构/时序
+"""
+        stop_payload = json.dumps(
+            {
+                "session_id": "codex_condense_stop",
+                "cwd": str(self.workspace),
+                "hook_event_name": "Stop",
+                "turn_id": "turn_condense",
+                "stop_hook_active": False,
+                "last_assistant_message": chatty_message,
+            }
+        )
+        stop = subprocess.run(
+            [sys.executable, "-m", "asm.cli", "codex-hook"],
+            cwd=str(self.workspace),
+            env=self.env,
+            text=True,
+            input=stop_payload,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(stop.returncode, 0, stop.stderr)
+
+        with sqlite3.connect(self.home / "registry.db") as conn:
+            row = conn.execute(
+                "SELECT title, goal, latest_summary FROM sessions WHERE agent = ? AND agent_session_ref = ?",
+                ("codex", "codex_condense_stop"),
+            ).fetchone()
+
+        self.assertLessEqual(len(row[0]), 100)
+        self.assertLessEqual(len(row[1]), 100)
+        self.assertLessEqual(len(row[2]), 100)
+        self.assertNotIn("docs/architecture.md", row[2])
+        self.assertNotIn("可以直接用任一种方式", row[2])
 
     def test_current_returns_best_matching_session_for_context(self) -> None:
         self.run_cli("init")

@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     title TEXT,
     goal TEXT,
     latest_summary TEXT,
+    clarification_requested INTEGER NOT NULL DEFAULT 0,
     path TEXT NOT NULL,
     git_root TEXT,
     project TEXT,
@@ -116,10 +117,10 @@ class Registry:
             conn.execute(
                 """
                 INSERT INTO sessions (
-                    id, agent, agent_session_ref, resume_command, title, goal, latest_summary, path,
+                    id, agent, agent_session_ref, resume_command, title, goal, latest_summary, clarification_requested, path,
                     git_root, project, branch, hostname, tmux_session, status, started_at, ended_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, 'active', ?, NULL, ?)
+                VALUES (?, ?, ?, ?, NULL, NULL, NULL, 0, ?, ?, ?, ?, ?, ?, 'active', ?, NULL, ?)
                 """,
                 (
                     session_id,
@@ -237,6 +238,39 @@ class Registry:
 
     def session_has_checkpoints(self, session_id: str) -> bool:
         return self._checkpoint_count(session_id) > 0
+
+    def session_row_by_agent_ref(self, agent: str, agent_session_ref: str) -> sqlite3.Row:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM sessions WHERE agent = ? AND agent_session_ref = ?",
+                (agent, agent_session_ref),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown session for {agent}:{agent_session_ref}")
+        return row
+
+    def update_session_semantics(self, session_id: str, *, title: str | None, goal: str | None) -> None:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE sessions
+                SET title = COALESCE(?, title),
+                    goal = COALESCE(?, goal),
+                    clarification_requested = 0,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (title, goal, now, session_id),
+            )
+
+    def mark_clarification_requested(self, session_id: str) -> None:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE sessions SET clarification_requested = 1, updated_at = ? WHERE id = ?",
+                (now, session_id),
+            )
 
     def list_sessions(
         self,

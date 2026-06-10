@@ -286,12 +286,76 @@ def _read_stdin(stdin_cache: list[str | None]) -> str:
 
 
 def _derive_title_from_summary(summary: str) -> str:
-    words = summary.replace("\n", " ").split()
-    return " ".join(words[:6]).strip() or "Untitled Session"
+    condensed = _condense_message(summary, limit=60)
+    return condensed or "Untitled Session"
 
 
 def _derive_goal_from_summary(summary: str) -> str:
-    return summary.strip()
+    return _condense_message(summary, limit=100)
+
+
+def _condense_message(message: str, limit: int = 100) -> str:
+    normalized = message.replace("\r", "\n").strip()
+    if not normalized:
+        return ""
+
+    candidates: list[str] = []
+    for raw_line in normalized.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith(("-", "*", "`")):
+            continue
+        if "可以直接用任一种方式" in line:
+            continue
+        if "如果你愿意" in line:
+            continue
+        if "我会按这个方式" in line:
+            continue
+        candidates.append(line)
+
+    if not candidates:
+        candidates = [normalized.splitlines()[0].strip()]
+
+    text = " ".join(candidates)
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    truncated = text[:limit].rstrip()
+    return truncated
+
+
+AMBIGUOUS_PROMPTS = {
+    "继续",
+    "继续吧",
+    "继续一下",
+    "帮我看看",
+    "看一下",
+    "先看看",
+    "review 一下",
+    "review一下",
+    "解释一下",
+}
+
+
+def _is_clear_task_prompt(prompt: str) -> bool:
+    normalized = " ".join(prompt.strip().split())
+    if not normalized:
+        return False
+    if normalized in AMBIGUOUS_PROMPTS:
+        return False
+    short_ambiguous_prefixes = ("继续", "看看", "分析一下", "解释一下", "review")
+    if any(normalized.startswith(prefix) for prefix in short_ambiguous_prefixes) and len(normalized) <= 12:
+        return False
+    return len(normalized) >= 8
+
+
+def _derive_title_from_prompt(prompt: str) -> str:
+    return _condense_message(prompt, limit=60) or "Untitled Session"
+
+
+def _clarification_message() -> str:
+    return "在继续之前，请先用一句话说明这次要处理的具体任务目标。"
 
 
 def _handle_codex_hook(registry: Registry, payload: dict[str, object]) -> int:
@@ -305,14 +369,27 @@ def _handle_codex_hook(registry: Registry, payload: dict[str, object]) -> int:
         return 0
 
     if event_name == "UserPromptSubmit":
-        registry.touch_session_by_agent_ref("codex", session_ref)
+        session_id = registry.touch_session_by_agent_ref("codex", session_ref)
+        prompt = payload.get("prompt")
+        if isinstance(prompt, str):
+            row = registry.session_row_by_agent_ref("codex", session_ref)
+            has_semantics = bool(row["title"] and row["goal"])
+            if _is_clear_task_prompt(prompt):
+                registry.update_session_semantics(
+                    session_id,
+                    title=_derive_title_from_prompt(prompt),
+                    goal=_condense_message(prompt, limit=100),
+                )
+            elif not has_semantics and not bool(row["clarification_requested"]):
+                registry.mark_clarification_requested(session_id)
+                print(json.dumps({"systemMessage": _clarification_message()}))
         return 0
 
     if event_name == "Stop":
         session_id = registry.touch_session_by_agent_ref("codex", session_ref)
         last_assistant_message = payload.get("last_assistant_message")
         if isinstance(last_assistant_message, str) and last_assistant_message.strip():
-            summary = last_assistant_message.strip()
+            summary = _condense_message(last_assistant_message.strip(), limit=100)
             if registry.session_has_checkpoints(session_id):
                 checkpoint_payload = CheckpointPayload(
                     summary=summary,
