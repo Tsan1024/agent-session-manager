@@ -1,0 +1,2 @@
+#!/bin/sh
+PYTHONPATH="$(dirname "$0")/src${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m asm.cli "$@"
