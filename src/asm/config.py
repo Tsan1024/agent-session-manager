@@ -11,6 +11,7 @@ class AppPaths:
     codex_home: Path
     registry_db: Path
     codex_hooks: Path
+    codex_prompts_dir: Path
     asm_bin_dir: Path
     codex_hook_runner: Path
 
@@ -23,6 +24,7 @@ def resolve_paths() -> AppPaths:
         codex_home=codex_home,
         registry_db=asm_home / "registry.db",
         codex_hooks=codex_home / "hooks.json",
+        codex_prompts_dir=codex_home / "prompts",
         asm_bin_dir=asm_home / "bin",
         codex_hook_runner=asm_home / "bin" / "asm-codex-hook",
     )

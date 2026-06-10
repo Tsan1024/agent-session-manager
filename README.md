@@ -115,6 +115,25 @@ Suggested Codex-side interaction:
 6. Prefer `./asm stop-current` for normal session shutdown.
 7. Use `./asm checkpoint --session ...` or `./asm stop --session ...` when you need explicit control.
 
+Codex Stop hook behavior:
+
+- if a session already has at least one structured checkpoint, the Codex `Stop` hook will automatically write a final checkpoint using `last_assistant_message` as the summary
+- this does not replace explicit checkpoints; it only improves the default shutdown path
+
+Codex prompt integration:
+
+- `asm init` installs two prompt files into `~/.codex/prompts/`
+- use them inside Codex to generate JSON more naturally:
+  - `asm-checkpoint`
+  - `asm-final`
+
+Recommended Codex flow after `asm init`:
+
+1. In Codex, invoke the installed checkpoint prompt.
+2. Let Codex output JSON only.
+3. Pipe that JSON to `./asm checkpoint-current`.
+4. At the end, use the installed final prompt and pipe the result to `./asm stop-current`.
+
 ## Listing Sessions
 
 List recent sessions globally:

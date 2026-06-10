@@ -235,6 +235,9 @@ class Registry:
             )
         return str(row["id"])
 
+    def session_has_checkpoints(self, session_id: str) -> bool:
+        return self._checkpoint_count(session_id) > 0
+
     def list_sessions(
         self,
         limit: int = 20,

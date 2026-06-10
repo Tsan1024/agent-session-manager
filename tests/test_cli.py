@@ -51,6 +51,10 @@ class AsmCliTests(unittest.TestCase):
         hooks_path = self.codex_home / "hooks.json"
         self.assertTrue(hooks_path.exists())
         self.assertTrue((self.home / "bin" / "asm-codex-hook").exists())
+        checkpoint_prompt = self.codex_home / "prompts" / "asm-checkpoint.md"
+        final_prompt = self.codex_home / "prompts" / "asm-final.md"
+        self.assertTrue(checkpoint_prompt.exists())
+        self.assertTrue(final_prompt.exists())
 
         with sqlite3.connect(db_path) as conn:
             tables = {
@@ -66,6 +70,8 @@ class AsmCliTests(unittest.TestCase):
         self.assertIn("SessionStart", hooks["hooks"])
         self.assertIn("UserPromptSubmit", hooks["hooks"])
         self.assertIn("Stop", hooks["hooks"])
+        self.assertIn("Generate ASM checkpoint JSON", checkpoint_prompt.read_text())
+        self.assertIn("Generate ASM final checkpoint JSON", final_prompt.read_text())
 
     def test_start_creates_single_session_for_agent_ref(self) -> None:
         self.run_cli("init")
@@ -465,6 +471,85 @@ class AsmCliTests(unittest.TestCase):
         self.assertEqual(row[0], "codex_real_session")
         self.assertEqual(row[1], "stopped")
         self.assertIsNotNone(row[2])
+
+    def test_codex_stop_hook_writes_auto_final_checkpoint_when_session_has_semantic_context(self) -> None:
+        self.run_cli("init")
+
+        start_payload = json.dumps(
+            {
+                "session_id": "codex_auto_checkpoint",
+                "cwd": str(self.workspace),
+                "hook_event_name": "SessionStart",
+                "source": "startup",
+            }
+        )
+        start = subprocess.run(
+            [sys.executable, "-m", "asm.cli", "codex-hook"],
+            cwd=str(self.workspace),
+            env=self.env,
+            text=True,
+            input=start_payload,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(start.returncode, 0, start.stderr)
+
+        with sqlite3.connect(self.home / "registry.db") as conn:
+            session_id = conn.execute(
+                "SELECT id FROM sessions WHERE agent = ? AND agent_session_ref = ?",
+                ("codex", "codex_auto_checkpoint"),
+            ).fetchone()[0]
+
+        payload = json.dumps(
+            {
+                "title": "Auto Final Session",
+                "goal": "Let Stop hook write a final checkpoint",
+                "summary": "semantic context exists",
+                "completed": [],
+                "blockers": [],
+                "next_actions": [],
+            }
+        )
+        checkpoint = self.run_cli("checkpoint", "--session", session_id, "--payload", payload)
+        self.assertEqual(checkpoint.returncode, 0, checkpoint.stderr)
+
+        stop_payload = json.dumps(
+            {
+                "session_id": "codex_auto_checkpoint",
+                "cwd": str(self.workspace),
+                "hook_event_name": "Stop",
+                "turn_id": "turn_final",
+                "stop_hook_active": False,
+                "last_assistant_message": "Completed the requested changes and verified the tests pass.",
+            }
+        )
+        stop = subprocess.run(
+            [sys.executable, "-m", "asm.cli", "codex-hook"],
+            cwd=str(self.workspace),
+            env=self.env,
+            text=True,
+            input=stop_payload,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(stop.returncode, 0, stop.stderr)
+        self.assertEqual(json.loads(stop.stdout), {"continue": True})
+
+        with sqlite3.connect(self.home / "registry.db") as conn:
+            row = conn.execute(
+                "SELECT status, latest_summary FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            checkpoint_kinds = [
+                value[0]
+                for value in conn.execute(
+                    "SELECT kind FROM checkpoints WHERE session_id = ? ORDER BY created_at ASC",
+                    (session_id,),
+                ).fetchall()
+            ]
+        self.assertEqual(row[0], "stopped")
+        self.assertEqual(row[1], "Completed the requested changes and verified the tests pass.")
+        self.assertEqual(checkpoint_kinds, ["progress", "final"])
 
     def test_current_returns_best_matching_session_for_context(self) -> None:
         self.run_cli("init")

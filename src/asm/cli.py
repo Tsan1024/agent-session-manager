@@ -294,7 +294,21 @@ def _handle_codex_hook(registry: Registry, payload: dict[str, object]) -> int:
         return 0
 
     if event_name == "Stop":
-        registry.stop_session_by_agent_ref("codex", session_ref)
+        session_id = registry.touch_session_by_agent_ref("codex", session_ref)
+        last_assistant_message = payload.get("last_assistant_message")
+        if isinstance(last_assistant_message, str) and last_assistant_message.strip():
+            if registry.session_has_checkpoints(session_id):
+                registry.add_checkpoint(
+                    session_id,
+                    "final",
+                    CheckpointPayload(
+                        summary=last_assistant_message.strip(),
+                        completed=[],
+                        blockers=[],
+                        next_actions=[],
+                    ),
+                )
+        registry.stop_session(session_id)
         print(json.dumps({"continue": True}))
         return 0
 
