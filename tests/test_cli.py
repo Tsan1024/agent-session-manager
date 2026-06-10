@@ -291,6 +291,64 @@ class AsmCliTests(unittest.TestCase):
         session_headers = [line for line in lines if line.startswith("asm_")]
         self.assertEqual(len(session_headers), 1)
 
+    def test_ls_supports_project_filter(self) -> None:
+        self.run_cli("init")
+
+        primary = self.run_cli("start", "--agent", "codex", "--agent-session-ref", "sess_project_primary")
+        primary_id = primary.stdout.strip()
+        primary_payload = json.dumps(
+            {
+                "title": "Repo Session",
+                "goal": "Belongs to the default repo project",
+                "summary": "primary project session",
+                "completed": [],
+                "blockers": [],
+                "next_actions": [],
+            }
+        )
+        self.run_cli("checkpoint", "--session", primary_id, "--payload", primary_payload)
+
+        alt_workspace = Path(self.tmp.name) / "alt-workspace"
+        alt_workspace.mkdir()
+        alt_env = self.env.copy()
+        alt_env["ASM_TEST_GIT_ROOT"] = str(alt_workspace / "other-project")
+        alt_env["ASM_TEST_BRANCH"] = "feature/other"
+        (alt_workspace / "other-project").mkdir()
+        alt_start = subprocess.run(
+            [sys.executable, "-m", "asm.cli", "start", "--agent", "codex", "--agent-session-ref", "sess_project_other"],
+            cwd=str(alt_workspace),
+            env=alt_env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(alt_start.returncode, 0, alt_start.stderr)
+        alt_id = alt_start.stdout.strip()
+        alt_payload = json.dumps(
+            {
+                "title": "Other Project Session",
+                "goal": "Belongs to another project",
+                "summary": "other project session",
+                "completed": [],
+                "blockers": [],
+                "next_actions": [],
+            }
+        )
+        alt_checkpoint = subprocess.run(
+            [sys.executable, "-m", "asm.cli", "checkpoint", "--session", alt_id, "--payload", alt_payload],
+            cwd=str(alt_workspace),
+            env=alt_env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(alt_checkpoint.returncode, 0, alt_checkpoint.stderr)
+
+        result = self.run_cli("ls", "--project", "repo")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Repo Session", result.stdout)
+        self.assertNotIn("Other Project Session", result.stdout)
+
     def test_doctor_prefers_same_branch_and_explains_match(self) -> None:
         self.run_cli("init")
         start = self.run_cli("start", "--agent", "codex", "--agent-session-ref", "sess_doc")

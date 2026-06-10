@@ -46,6 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     ls_parser.add_argument("--agent")
     ls_parser.add_argument("--status", choices=["active", "stopped"])
     ls_parser.add_argument("--branch")
+    ls_parser.add_argument("--project")
     ls_parser.add_argument("--long", action="store_true", dest="long_output")
 
     doctor_parser = subparsers.add_parser("doctor")
@@ -167,6 +168,7 @@ def main(argv: list[str] | None = None) -> int:
                 agent=args.agent,
                 status=args.status,
                 branch=args.branch,
+                project=args.project,
             )
             for row in rows:
                 title = row["title"] or "[untitled]"

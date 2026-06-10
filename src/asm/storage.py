@@ -242,6 +242,7 @@ class Registry:
         agent: str | None = None,
         status: str | None = None,
         branch: str | None = None,
+        project: str | None = None,
     ) -> list[sqlite3.Row]:
         clauses: list[str] = []
         values: list[object] = []
@@ -254,6 +255,9 @@ class Registry:
         if branch:
             clauses.append("branch = ?")
             values.append(branch)
+        if project:
+            clauses.append("project = ?")
+            values.append(project)
 
         where_sql = ""
         if clauses:

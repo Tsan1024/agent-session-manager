@@ -129,6 +129,7 @@ Filter by status, branch, or agent:
 ./asm ls --status active
 ./asm ls --status stopped
 ./asm ls --branch feature/my-branch
+./asm ls --project my-project
 ./asm ls --agent codex
 ```
 
