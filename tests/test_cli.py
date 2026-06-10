@@ -573,6 +573,29 @@ class AsmCliTests(unittest.TestCase):
         self.assertIn("Current Session", result.stdout)
         self.assertIn("codex resume sess_current", result.stdout)
 
+    def test_current_explain_shows_scoring_breakdown(self) -> None:
+        self.run_cli("init")
+        start = self.run_cli("start", "--agent", "codex", "--agent-session-ref", "sess_current_explain")
+        session_id = start.stdout.strip()
+        payload = json.dumps(
+            {
+                "title": "Current Explain Session",
+                "goal": "Explain current selection",
+                "summary": "current explain should show why",
+                "completed": [],
+                "blockers": [],
+                "next_actions": [],
+            }
+        )
+        self.run_cli("checkpoint", "--session", session_id, "--payload", payload)
+
+        result = self.run_cli("current", "--explain")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Current Explain Session", result.stdout)
+        self.assertIn("why:", result.stdout)
+        self.assertIn("+30 same git root", result.stdout)
+        self.assertIn("+20 same branch", result.stdout)
+
     def test_checkpoint_template_outputs_valid_json(self) -> None:
         result = self.run_cli("checkpoint-template")
         self.assertEqual(result.returncode, 0, result.stderr)

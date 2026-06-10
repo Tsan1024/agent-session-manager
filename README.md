@@ -53,6 +53,12 @@ Find the current best-matching session for this workspace:
 ./asm current
 ```
 
+Explain why that session was selected:
+
+```bash
+./asm current --explain
+```
+
 Print an empty checkpoint template:
 
 ```bash

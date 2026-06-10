@@ -53,7 +53,8 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_parser.add_argument("--limit", type=int, default=5)
     doctor_parser.add_argument("--explain", action="store_true")
 
-    subparsers.add_parser("current")
+    current_parser = subparsers.add_parser("current")
+    current_parser.add_argument("--explain", action="store_true")
     subparsers.add_parser("checkpoint-template")
     subparsers.add_parser("checkpoint-prompt")
 
@@ -224,7 +225,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  resume: {match.resume_command}")
             if match.latest_summary:
                 print(f"  last: {match.latest_summary}")
-            print(f"  reasons: {', '.join(match.reasons)}")
+            if args.explain:
+                print("  why:")
+                for value, label in match.reason_scores:
+                    print(f"    +{value} {label}")
+            else:
+                print(f"  reasons: {', '.join(match.reasons)}")
             return 0
 
         if args.command == "codex-hook":
