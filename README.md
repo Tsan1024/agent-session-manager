@@ -2,6 +2,13 @@
 
 Agent Session Manager (ASM) is a local-first registry for agent sessions. It records Codex session metadata, stores structured checkpoints, and helps identify the correct session to resume later.
 
+ASM is already adapted for Codex as its first supported agent runtime:
+
+- `asm init` installs Codex hooks and prompt files
+- imported Codex sessions use native `codex resume <session_id>` commands
+- ASM can auto-sync from native Codex transcript files under `~/.codex/sessions`
+- `checkpoint-current`, `finalize-current`, and `stop-current` can operate against the current Codex session
+
 ## Why ASM Exists
 
 Modern agent workflows are fragmented across multiple terminals, projects, branches, and tools. A few hours later, you often remember the work itself, but not which agent session it belonged to.
