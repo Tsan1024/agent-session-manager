@@ -20,8 +20,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     agent_session_ref TEXT NOT NULL,
     resume_command TEXT NOT NULL,
     title TEXT,
+    initial_prompt TEXT,
     goal TEXT,
     latest_summary TEXT,
+    latest_summary_source TEXT CHECK(latest_summary_source IN ('agent', 'fallback')),
     clarification_requested INTEGER NOT NULL DEFAULT 0,
     path TEXT NOT NULL,
     git_root TEXT,
@@ -40,6 +42,7 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     kind TEXT NOT NULL,
+    source TEXT NOT NULL CHECK(source IN ('agent', 'fallback')),
     title TEXT,
     goal TEXT,
     summary TEXT NOT NULL,
@@ -55,10 +58,12 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 class DoctorMatch:
     session_id: str
     title: str | None
+    initial_prompt: str | None
     project: str | None
     branch: str | None
     status: str
     latest_summary: str | None
+    latest_summary_source: str | None
     resume_command: str
     score: int
     reasons: list[str]
@@ -77,12 +82,34 @@ class Registry:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
 
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        session_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        if "clarification_requested" not in session_columns:
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN clarification_requested INTEGER NOT NULL DEFAULT 0"
+            )
+        if "initial_prompt" not in session_columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN initial_prompt TEXT")
+        if "latest_summary_source" not in session_columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN latest_summary_source TEXT")
+
+        checkpoint_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(checkpoints)").fetchall()
+        }
+        if "source" not in checkpoint_columns:
+            conn.execute(
+                "ALTER TABLE checkpoints ADD COLUMN source TEXT NOT NULL DEFAULT 'agent' CHECK(source IN ('agent', 'fallback'))"
+            )
 
     def start_session(self, agent: str, agent_session_ref: str, context: ShellContext) -> str:
         resume_command = f"{agent} resume {agent_session_ref}" if agent == "codex" else agent_session_ref
@@ -117,10 +144,10 @@ class Registry:
             conn.execute(
                 """
                 INSERT INTO sessions (
-                    id, agent, agent_session_ref, resume_command, title, goal, latest_summary, clarification_requested, path,
+                    id, agent, agent_session_ref, resume_command, title, initial_prompt, goal, latest_summary, clarification_requested, path,
                     git_root, project, branch, hostname, tmux_session, status, started_at, ended_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, NULL, NULL, NULL, 0, ?, ?, ?, ?, ?, ?, 'active', ?, NULL, ?)
+                VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, ?, ?, ?, ?, ?, ?, 'active', ?, NULL, ?)
                 """,
                 (
                     session_id,
@@ -149,10 +176,21 @@ class Registry:
             raise ValueError(f"unknown session: {session_id}")
         return row
 
-    def add_checkpoint(self, session_id: str, kind: str, payload: CheckpointPayload) -> None:
+    def add_checkpoint(
+        self,
+        session_id: str,
+        kind: str,
+        payload: CheckpointPayload,
+        *,
+        source: str = "agent",
+    ) -> None:
         current = self.require_session(session_id)
         has_existing_checkpoint = self._checkpoint_count(session_id) > 0
-        if not has_existing_checkpoint and (not payload.title or not payload.goal):
+        has_session_semantics = bool(current["title"] and current["goal"])
+        requires_semantics = kind != "final"
+        if requires_semantics and not has_existing_checkpoint and not has_session_semantics and (
+            not payload.title or not payload.goal
+        ):
             raise ValueError("first checkpoint must include title and goal")
 
         created_at = utc_now()
@@ -161,15 +199,16 @@ class Registry:
             conn.execute(
                 """
                 INSERT INTO checkpoints (
-                    id, session_id, kind, title, goal, summary, completed_json, blockers_json,
+                    id, session_id, kind, source, title, goal, summary, completed_json, blockers_json,
                     next_actions_json, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     checkpoint_id,
                     session_id,
                     kind,
+                    source,
                     payload.title,
                     payload.goal,
                     payload.summary,
@@ -185,6 +224,7 @@ class Registry:
                 SET title = COALESCE(?, title),
                     goal = COALESCE(?, goal),
                     latest_summary = ?,
+                    latest_summary_source = ?,
                     updated_at = ?
                 WHERE id = ?
                 """,
@@ -192,6 +232,7 @@ class Registry:
                     payload.title,
                     payload.goal,
                     payload.summary,
+                    source,
                     created_at,
                     session_id,
                 ),
@@ -272,6 +313,19 @@ class Registry:
                 (now, session_id),
             )
 
+    def record_initial_prompt(self, session_id: str, prompt: str) -> None:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE sessions
+                SET initial_prompt = COALESCE(initial_prompt, ?),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (prompt, now, session_id),
+            )
+
     def list_sessions(
         self,
         limit: int = 20,
@@ -303,8 +357,63 @@ class Registry:
         with self.connect() as conn:
             rows = conn.execute(
                 f"""
-                SELECT id, agent, agent_session_ref, resume_command, title, goal, project, branch, status,
-                       updated_at, latest_summary
+                SELECT id, agent, agent_session_ref, resume_command, title, initial_prompt, goal, project, branch, status,
+                       updated_at, latest_summary, latest_summary_source
+                FROM sessions
+                {where_sql}
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                [*values, limit],
+            ).fetchall()
+        return list(rows)
+
+    def search_sessions(
+        self,
+        query: str,
+        limit: int = 20,
+        *,
+        agent: str | None = None,
+        status: str | None = None,
+        branch: str | None = None,
+        project: str | None = None,
+    ) -> list[sqlite3.Row]:
+        clauses: list[str] = []
+        values: list[object] = []
+        if agent:
+            clauses.append("agent = ?")
+            values.append(agent)
+        if status:
+            clauses.append("status = ?")
+            values.append(status)
+        if branch:
+            clauses.append("branch = ?")
+            values.append(branch)
+        if project:
+            clauses.append("project = ?")
+            values.append(project)
+
+        normalized_query = f"%{query.strip()}%"
+        clauses.append(
+            "("
+            "COALESCE(title, '') LIKE ? OR "
+            "COALESCE(initial_prompt, '') LIKE ? OR "
+            "COALESCE(goal, '') LIKE ? OR "
+            "COALESCE(latest_summary, '') LIKE ? OR "
+            "COALESCE(project, '') LIKE ? OR "
+            "COALESCE(branch, '') LIKE ? OR "
+            "COALESCE(path, '') LIKE ?"
+            ")"
+        )
+        values.extend([normalized_query] * 7)
+
+        where_sql = "WHERE " + " AND ".join(clauses)
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, agent, agent_session_ref, resume_command, title, initial_prompt, goal, project, branch, status,
+                       updated_at, latest_summary, latest_summary_source
                 FROM sessions
                 {where_sql}
                 ORDER BY updated_at DESC
@@ -318,7 +427,8 @@ class Registry:
         with self.connect() as conn:
             rows = conn.execute(
                 """
-                SELECT id, title, project, branch, status, latest_summary, resume_command, path, git_root, updated_at
+                SELECT id, title, initial_prompt, project, branch, status, latest_summary, latest_summary_source,
+                       resume_command, path, git_root, updated_at
                 FROM sessions
                 ORDER BY updated_at DESC
                 """
@@ -351,10 +461,12 @@ class Registry:
                 DoctorMatch(
                     session_id=str(row["id"]),
                     title=row["title"],
+                    initial_prompt=row["initial_prompt"],
                     project=row["project"],
                     branch=row["branch"],
                     status=row["status"],
                     latest_summary=row["latest_summary"],
+                    latest_summary_source=row["latest_summary_source"],
                     resume_command=row["resume_command"],
                     score=score,
                     reasons=reasons,
@@ -371,3 +483,11 @@ class Registry:
                 (session_id,),
             ).fetchone()
         return int(row["count"])
+
+    def session_has_final_checkpoint(self, session_id: str) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS count FROM checkpoints WHERE session_id = ? AND kind = 'final'",
+                (session_id,),
+            ).fetchone()
+        return int(row["count"]) > 0

@@ -113,10 +113,15 @@ def _install_prompt_files(paths: AppPaths) -> None:
     final_prompt = "\n".join(
         [
             "---",
-            "description: Generate ASM final checkpoint JSON",
+            "description: Generate ASM final checkpoint JSON for finalize-current",
             "---",
-            "Please output only JSON for a final ASM checkpoint.",
+            "Generate the final structured checkpoint for ASM session recording.",
+            "This prompt is only for end-of-session recording and should not affect normal Q&A.",
+            "Please output only JSON for `asm finalize-current`.",
             "Do not add markdown fences, prose, or commentary.",
+            "Do not include greetings, options, or follow-up suggestions.",
+            "Prefer factual completion/status statements over advice.",
+            "If the task is not fully complete, state the current status honestly.",
             "",
             "{",
             '  "summary": "",',
@@ -125,8 +130,45 @@ def _install_prompt_files(paths: AppPaths) -> None:
             '  "next_actions": []',
             "}",
             "",
-            "Use one sentence for summary.",
+            "Requirements:",
+            "- `summary`: one sentence stating what was completed or the current conclusion/status.",
+            "- `completed`: concrete finished work only.",
+            "- `blockers`: real blockers only; otherwise use an empty list.",
+            "- `next_actions`: specific next steps only; otherwise use an empty list.",
+        ]
+    )
+    finish_prompt = "\n".join(
+        [
+            "---",
+            "description: Generate a final ASM checkpoint and write it with asm finalize-current",
+            "---",
+            "You are finishing the current Codex task for ASM recording.",
+            "Do not change the user's code or continue solving the task.",
+            "Do not exit the agent session.",
+            "",
+            "Your job in this turn is:",
+            "1. Infer the best final ASM checkpoint JSON from the current conversation and repository state.",
+            "2. Write that JSON to a temporary file.",
+            "3. Run `asm finalize-current --payload-file <that file>`.",
+            "4. Remove the temporary file if the write succeeded.",
+            "5. Reply with one short confirmation that ASM was finalized, and remind the user they can `/quit` separately if they want to exit Codex.",
+            "",
+            "Hard constraints:",
+            "- Do not use `asm stop` or `asm stop-current` for this flow.",
+            "- Only use `asm finalize-current --payload-file <file>`.",
+            "- If the finalize command fails because ASM storage under `~/.asm` is not writable, request permission and retry that exact finalize command.",
+            "- Do not claim success unless `asm finalize-current` actually succeeds.",
+            "",
+            "JSON requirements:",
+            "- Include only: `summary`, `completed`, `blockers`, `next_actions`.",
+            "- `summary` must be one sentence stating what was completed or the current conclusion/status.",
+            "- `completed` must list concrete finished work only.",
+            "- `blockers` must list real blockers only; otherwise use an empty list.",
+            "- `next_actions` must list specific next steps only; otherwise use an empty list.",
+            "",
+            "Do not ask the user follow-up questions in this turn unless the finalize command fails.",
         ]
     )
     (paths.codex_prompts_dir / "asm-checkpoint.md").write_text(checkpoint_prompt + "\n")
     (paths.codex_prompts_dir / "asm-final.md").write_text(final_prompt + "\n")
+    (paths.codex_prompts_dir / "asm-finish.md").write_text(finish_prompt + "\n")
