@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
+import os
+import subprocess
 import sys
 import textwrap
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .codex_import import importable_codex_sessions
 from .codex_integration import install_codex_hooks
 from .config import resolve_paths
 from .context import current_context
 from .models import CheckpointPayload
 from .storage import Registry
+from .text import condense_message, derive_title_from_prompt, is_clear_task_prompt
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -107,6 +110,12 @@ def build_parser() -> argparse.ArgumentParser:
     ls_parser.add_argument("--status", choices=["active", "stopped"], help="filter by session status")
     ls_parser.add_argument("--branch", help="filter by git branch")
     ls_parser.add_argument("--project", help="filter by project name")
+    ls_parser.add_argument(
+        "--scope",
+        choices=["project", "path"],
+        default="project",
+        help="show scope as project name or full path",
+    )
     ls_parser.add_argument("--long", action="store_true", dest="long_output", help="show goal details")
 
     search_parser = subparsers.add_parser(
@@ -120,6 +129,12 @@ def build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("--status", choices=["active", "stopped"], help="filter by session status")
     search_parser.add_argument("--branch", help="filter by git branch")
     search_parser.add_argument("--project", help="filter by project name")
+    search_parser.add_argument(
+        "--scope",
+        choices=["project", "path"],
+        default="project",
+        help="show scope as project name or full path",
+    )
     search_parser.add_argument("--long", action="store_true", dest="long_output", help="show goal details")
     search_parser.add_argument("--explain", action="store_true", help="show matched fields")
 
@@ -130,6 +145,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     doctor_parser.add_argument("--limit", type=int, default=5, help="maximum number of recommendations to show")
     doctor_parser.add_argument("--explain", action="store_true", help="show scoring breakdown")
+    doctor_parser.add_argument(
+        "--scope",
+        choices=["project", "path"],
+        default="project",
+        help="show scope as project name or full path",
+    )
 
     current_parser = subparsers.add_parser(
         "current",
@@ -137,6 +158,12 @@ def build_parser() -> argparse.ArgumentParser:
         description="Show the single best-matching session for the current workspace.",
     )
     current_parser.add_argument("--explain", action="store_true", help="show scoring breakdown")
+    current_parser.add_argument(
+        "--scope",
+        choices=["project", "path"],
+        default="project",
+        help="show scope as project name or full path",
+    )
     subparsers.add_parser(
         "checkpoint-template",
         help="print an empty checkpoint JSON template",
@@ -146,6 +173,21 @@ def build_parser() -> argparse.ArgumentParser:
         "checkpoint-prompt",
         help="print a Codex-ready prompt for checkpoint JSON",
         description="Print a Codex-ready prompt that asks for checkpoint JSON only.",
+    )
+
+    import_codex_parser = subparsers.add_parser(
+        "import-codex",
+        help="import Codex sessions from ~/.codex/sessions",
+        description="Scan Codex transcript files and backfill ASM sessions with conservative metadata only.",
+    )
+    import_codex_parser.add_argument(
+        "--codex-home",
+        help="override Codex home directory; defaults to CODEX_HOME or ~/.codex",
+    )
+    import_codex_parser.add_argument(
+        "--limit",
+        type=int,
+        help="import only the most recent N transcript files",
     )
 
     subparsers.add_parser(
@@ -171,6 +213,18 @@ def main(argv: list[str] | None = None) -> int:
     stdin_cache: list[str | None] = [None]
 
     try:
+        if args.command in {
+            "ls",
+            "search",
+            "doctor",
+            "current",
+            "checkpoint-current",
+            "finalize-current",
+            "stop-current",
+        }:
+            registry.initialize()
+            _auto_sync_codex_sessions(registry, paths)
+
         if args.command == "checkpoint-template":
             print(
                 json.dumps(
@@ -208,6 +262,28 @@ def main(argv: list[str] | None = None) -> int:
                             indent=2,
                         ),
                     ]
+                )
+            )
+            return 0
+
+        if args.command == "import-codex":
+            registry.initialize()
+            codex_home = Path(args.codex_home).expanduser() if args.codex_home else paths.codex_home
+            created, updated, imported_count = _sync_codex_sessions(
+                registry,
+                codex_home=codex_home,
+                limit=args.limit,
+                force=True,
+            )
+            print(
+                json.dumps(
+                    {
+                        "imported": imported_count,
+                        "created": created,
+                        "updated": updated,
+                        "codex_home": str(codex_home),
+                    },
+                    ensure_ascii=False,
                 )
             )
             return 0
@@ -292,6 +368,7 @@ def main(argv: list[str] | None = None) -> int:
                     title=row["title"],
                     initial_prompt=row["initial_prompt"],
                     project=row["project"],
+                    path=row["path"],
                     branch=row["branch"],
                     status=row["status"],
                     resume_command=row["resume_command"],
@@ -299,6 +376,7 @@ def main(argv: list[str] | None = None) -> int:
                     goal=row["goal"] if args.long_output else None,
                     last=row["latest_summary"],
                     last_source=row["latest_summary_source"],
+                    scope_mode=args.scope,
                 )
             return 0
 
@@ -319,6 +397,7 @@ def main(argv: list[str] | None = None) -> int:
                     title=row["title"],
                     initial_prompt=row["initial_prompt"],
                     project=row["project"],
+                    path=row["path"],
                     branch=row["branch"],
                     status=row["status"],
                     resume_command=row["resume_command"],
@@ -327,6 +406,7 @@ def main(argv: list[str] | None = None) -> int:
                     last=row["latest_summary"],
                     last_source=row["latest_summary_source"],
                     reasons=reasons,
+                    scope_mode=args.scope,
                 )
             return 0
 
@@ -342,6 +422,7 @@ def main(argv: list[str] | None = None) -> int:
                     title=match.title,
                     initial_prompt=match.initial_prompt,
                     project=match.project,
+                    path=match.path,
                     branch=match.branch,
                     status=match.status,
                     resume_command=match.resume_command,
@@ -350,6 +431,7 @@ def main(argv: list[str] | None = None) -> int:
                     last_source=match.latest_summary_source,
                     reason_scores=match.reason_scores if args.explain else None,
                     reasons=match.reasons if not args.explain else None,
+                    scope_mode=args.scope,
                 )
             return 0
 
@@ -365,6 +447,7 @@ def main(argv: list[str] | None = None) -> int:
                 title=match.title,
                 initial_prompt=match.initial_prompt,
                 project=match.project,
+                path=match.path,
                 branch=match.branch,
                 status=match.status,
                 resume_command=match.resume_command,
@@ -373,6 +456,7 @@ def main(argv: list[str] | None = None) -> int:
                 last_source=match.latest_summary_source,
                 reason_scores=match.reason_scores if args.explain else None,
                 reasons=match.reasons if not args.explain else None,
+                scope_mode=args.scope,
             )
             return 0
 
@@ -428,194 +512,16 @@ def _read_stdin(stdin_cache: list[str | None]) -> str:
     return stdin_cache[0]
 
 
-SUMMARY_POSITIVE_MARKERS = (
-    "已确认",
-    "确认",
-    "完成",
-    "实现",
-    "修复",
-    "更新",
-    "验证",
-    "测试结果",
-    "结论",
-    "当前问题",
-    "可用",
-    "正常",
-    "通过",
-)
-
-SUMMARY_PRIORITY_PREFIXES = (
-    "已确认",
-    "确认",
-    "结论",
-    "当前问题",
-)
-
-SUMMARY_NEGATIVE_MARKERS = (
-    "如果你要",
-    "如果你愿意",
-    "我也可以",
-    "可以继续",
-    "下一步",
-    "比如",
-    "你觉得",
-    "我会",
-    "建议",
-)
-
-
-def _split_summary_candidates(text: str) -> list[str]:
-    parts = re.split(r"(?<=[。！？!?])|\n+", text)
-    candidates: list[str] = []
-    for part in parts:
-        candidate = " ".join(part.strip().split())
-        if candidate:
-            candidates.append(candidate)
-    return candidates
-
-
-def _score_summary_candidate(candidate: str) -> int:
-    score = 0
-    if len(candidate) <= 100:
-        score += 5
-    if any(candidate.startswith(prefix) for prefix in SUMMARY_PRIORITY_PREFIXES):
-        score += 40
-    if any(marker in candidate for marker in SUMMARY_POSITIVE_MARKERS):
-        score += 30
-    if "：" in candidate or ":" in candidate:
-        score += 5
-    if any(marker in candidate for marker in SUMMARY_NEGATIVE_MARKERS):
-        score -= 20
-    if candidate.endswith(("?", "？", "吗", "么", "呢")):
-        score -= 20
-    if candidate.startswith(("-", "*", "`")):
-        score -= 20
-    return score
-
-
 def _condense_message(message: str, limit: int = 100) -> str:
-    normalized = message.replace("\r", "\n").strip()
-    if not normalized:
-        return ""
-
-    candidates: list[str] = []
-    for raw_line in normalized.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        if line.startswith(("-", "*", "`")):
-            continue
-        if "可以直接用任一种方式" in line:
-            continue
-        if "如果你愿意" in line:
-            continue
-        if "我会按这个方式" in line:
-            continue
-        candidates.append(line)
-
-    if not candidates:
-        candidates = [normalized.splitlines()[0].strip()]
-
-    text = " ".join(candidates)
-    text = " ".join(text.split())
-    sentence_candidates = _split_summary_candidates(text)
-    if sentence_candidates:
-        best = max(sentence_candidates, key=lambda candidate: (_score_summary_candidate(candidate), -len(candidate)))
-        if _score_summary_candidate(best) > 0:
-            text = best
-    if len(text) <= limit:
-        return text
-    truncated = text[:limit].rstrip()
-    return truncated
-
-
-AMBIGUOUS_PROMPTS = {
-    "继续",
-    "继续吧",
-    "继续一下",
-    "帮我看看",
-    "看一下",
-    "先看看",
-    "review 一下",
-    "review一下",
-    "解释一下",
-}
-
-AMBIGUOUS_PHRASES = (
-    "你觉得",
-    "你认为",
-    "我应该",
-    "做什么",
-    "怎么做",
-    "怎么推进",
-    "给我建议",
-    "帮我想",
-    "下一步",
-    "从哪开始",
-)
-
-EXPLORATORY_PREFIXES = (
-    "我想",
-    "想先",
-    "先想",
-    "先看看",
-    "试试",
-    "我先试",
-)
-
-STRONG_TASK_MARKERS = (
-    "请",
-    "请你",
-    "帮我",
-    "麻烦",
-    "麻烦你",
-    "需要你",
-    "让你",
-)
-
-TASK_VERBS = (
-    "实现",
-    "修复",
-    "补上",
-    "增加",
-    "新增",
-    "编写",
-    "更新",
-    "整理",
-    "分析",
-    "排查",
-    "解释",
-    "审查",
-    "review",
-    "测试",
-    "优化",
-    "重构",
-)
+    return condense_message(message, limit=limit)
 
 
 def _is_clear_task_prompt(prompt: str) -> bool:
-    normalized = " ".join(prompt.strip().split())
-    if not normalized:
-        return False
-    if normalized in AMBIGUOUS_PROMPTS:
-        return False
-    if any(phrase in normalized for phrase in AMBIGUOUS_PHRASES):
-        return False
-    if normalized.endswith(("?", "？", "吗", "么", "呢")):
-        return False
-    short_ambiguous_prefixes = ("继续", "看看", "分析一下", "解释一下", "review")
-    if any(normalized.startswith(prefix) for prefix in short_ambiguous_prefixes) and len(normalized) <= 12:
-        return False
-    has_task_verb = any(verb in normalized for verb in TASK_VERBS)
-    if not has_task_verb or len(normalized) < 8:
-        return False
-    if any(normalized.startswith(prefix) for prefix in EXPLORATORY_PREFIXES):
-        return any(marker in normalized for marker in STRONG_TASK_MARKERS)
-    return True
+    return is_clear_task_prompt(prompt)
 
 
 def _derive_title_from_prompt(prompt: str) -> str:
-    return _condense_message(prompt, limit=60) or "Untitled Session"
+    return derive_title_from_prompt(prompt)
 
 
 def _clarification_message() -> str:
@@ -647,6 +553,7 @@ def _top_level_help() -> str:
             "  search               search recorded sessions by keyword",
             "  current              show the single best-matching session",
             "  doctor               recommend sessions for the current workspace",
+            "  import-codex         import Codex transcript metadata from ~/.codex/sessions",
             "",
             "codex integration",
             "  checkpoint-template  print an empty checkpoint JSON template",
@@ -661,6 +568,7 @@ def _top_level_help() -> str:
             "  asm current --explain",
             "  asm checkpoint-current --payload-file checkpoint.json",
             "  asm finalize-current --payload-file final.json",
+            "  asm import-codex --limit 50",
             "",
             "notes",
             "  asm-final            Codex prompt for end-of-session JSON only; does not exit the agent session",
@@ -676,6 +584,7 @@ def _print_session_card(
     title: str | None,
     initial_prompt: str | None = None,
     project: str | None,
+    path: str | None = None,
     branch: str | None,
     status: str,
     resume_command: str,
@@ -686,6 +595,7 @@ def _print_session_card(
     last_source: str | None = None,
     reasons: list[str] | None = None,
     reason_scores: list[tuple[int, str]] | None = None,
+    scope_mode: str = "project",
 ) -> None:
     display_title = _display_title(title, initial_prompt)
     display_goal = _display_goal(goal)
@@ -694,7 +604,8 @@ def _print_session_card(
     print(f"[{session_id}] {heading}")
     if agent and score is not None:
         _print_wrapped_field("agent", agent)
-    scope = f"{project or '-'} @ {branch or '-'}"
+    scope_root = path if scope_mode == "path" else project
+    scope = f"{scope_root or '-'} @ {branch or '-'}"
     _print_wrapped_field("scope", scope)
     meta_parts = [status]
     if score is not None:
@@ -870,6 +781,92 @@ def _handle_codex_hook(registry: Registry, payload: dict[str, object]) -> int:
         return 0
 
     return 0
+
+
+def _find_git_root(path: Path) -> str | None:
+    current = path.resolve()
+    for candidate in (current, *current.parents):
+        if (candidate / ".git").exists():
+            return str(candidate)
+    return None
+
+
+def _auto_sync_codex_sessions(registry: Registry, paths: object) -> None:
+    try:
+        _sync_codex_sessions(registry, codex_home=paths.codex_home, limit=200, force=False)
+    except (OSError, ValueError):
+        return
+
+
+def _sync_codex_sessions(
+    registry: Registry,
+    *,
+    codex_home: Path,
+    limit: int | None,
+    force: bool,
+) -> tuple[int, int, int]:
+    known_mtimes = None if force else registry.imported_codex_file_mtimes()
+    imported = importable_codex_sessions(codex_home, limit=limit, known_mtimes=known_mtimes)
+    created = 0
+    updated = 0
+    current_thread_id = os.environ.get("CODEX_THREAD_ID")
+
+    for item in imported:
+        imported_path = Path(item.path).expanduser()
+        git_root = _find_git_root(imported_path)
+        project = Path(git_root).name if git_root else imported_path.name
+        branch = _find_git_branch(imported_path)
+        status = "active" if current_thread_id and item.agent_session_ref == current_thread_id else "stopped"
+        if status == "active":
+            context = current_context()
+            imported_path = Path(context.path)
+            git_root = context.git_root
+            project = context.project
+            branch = context.branch
+        _, action = registry.import_codex_session(
+            agent_session_ref=item.agent_session_ref,
+            path=str(imported_path),
+            git_root=git_root,
+            project=project,
+            branch=branch,
+            started_at=item.started_at,
+            updated_at=item.updated_at,
+            initial_prompt=item.initial_prompt,
+            latest_summary=item.latest_summary,
+            session_file_path=item.session_file_path,
+            session_file_mtime_ns=item.session_file_mtime_ns,
+            status=status,
+        )
+        if action == "created":
+            created += 1
+        else:
+            updated += 1
+    return created, updated, len(imported)
+
+
+def _find_git_root(path: Path) -> str | None:
+    current = path.resolve()
+    for candidate in (current, *current.parents):
+        if (candidate / ".git").exists():
+            return str(candidate)
+    return None
+
+
+def _find_git_branch(path: Path) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=str(path.resolve()),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    return value or None
 
 
 if __name__ == "__main__":

@@ -32,6 +32,76 @@ class AsmCliTests(unittest.TestCase):
             source_path if not existing_pythonpath else os.pathsep.join([source_path, existing_pythonpath])
         )
 
+    def write_codex_session(
+        self,
+        relative_path: str,
+        *,
+        session_id: str,
+        cwd: Path,
+        started_at: str,
+        user_prompt: str | None = None,
+        assistant_message: str | None = None,
+        updated_at: str | None = None,
+    ) -> Path:
+        session_path = self.codex_home / "sessions" / relative_path
+        session_path.parent.mkdir(parents=True, exist_ok=True)
+        lines = [
+            json.dumps(
+                {
+                    "timestamp": updated_at or started_at,
+                    "type": "session_meta",
+                    "payload": {
+                        "id": session_id,
+                        "timestamp": started_at,
+                        "cwd": str(cwd),
+                        "originator": "codex-tui",
+                    },
+                }
+            )
+        ]
+        if user_prompt is not None:
+            lines.append(
+                json.dumps(
+                    {
+                        "timestamp": updated_at or started_at,
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": user_prompt}],
+                        },
+                    }
+                )
+            )
+        if assistant_message is not None:
+            lines.append(
+                json.dumps(
+                    {
+                        "timestamp": updated_at or started_at,
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": assistant_message}],
+                        },
+                    }
+                )
+            )
+        session_path.write_text("\n".join(lines) + "\n")
+        return session_path
+
+    def init_git_repo(self, repo: Path, branch: str) -> None:
+        repo.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init"], cwd=str(repo), env=self.env, check=False, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "checkout", "-b", branch],
+            cwd=str(repo),
+            env=self.env,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
     def run_cli(self, *args: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [sys.executable, "-m", "asm.cli", *args],
@@ -362,6 +432,57 @@ class AsmCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Repo Session", result.stdout)
         self.assertNotIn("Other Project Session", result.stdout)
+
+    def test_ls_scope_path_shows_full_path(self) -> None:
+        self.run_cli("init")
+        start = self.run_cli("start", "--agent", "codex", "--agent-session-ref", "sess_scope_path")
+        session_id = start.stdout.strip()
+        payload = json.dumps(
+            {
+                "title": "Scope Path Session",
+                "goal": "Display full path scope",
+                "summary": "path scope should show absolute path",
+                "completed": [],
+                "blockers": [],
+                "next_actions": [],
+            }
+        )
+        self.run_cli("checkpoint", "--session", session_id, "--payload", payload)
+
+        result = self.run_cli("ls", "--scope", "path")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        expected_paths = {
+            str(self.workspace.resolve()),
+            f"/private{self.workspace.resolve()}" if str(self.workspace.resolve()).startswith("/var/") else str(self.workspace.resolve()),
+        }
+        self.assertTrue(any(path in result.stdout for path in expected_paths))
+        self.assertIn("feature/test", result.stdout)
+        self.assertNotIn("scope  repo @ feature/test", result.stdout)
+
+    def test_current_scope_path_shows_full_path(self) -> None:
+        self.run_cli("init")
+        start = self.run_cli("start", "--agent", "codex", "--agent-session-ref", "sess_current_scope_path")
+        session_id = start.stdout.strip()
+        payload = json.dumps(
+            {
+                "title": "Current Scope Path Session",
+                "goal": "Display current full path scope",
+                "summary": "current path scope should show absolute path",
+                "completed": [],
+                "blockers": [],
+                "next_actions": [],
+            }
+        )
+        self.run_cli("checkpoint", "--session", session_id, "--payload", payload)
+
+        result = self.run_cli("current", "--scope", "path")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        expected_paths = {
+            str(self.workspace.resolve()),
+            f"/private{self.workspace.resolve()}" if str(self.workspace.resolve()).startswith("/var/") else str(self.workspace.resolve()),
+        }
+        self.assertTrue(any(path in result.stdout for path in expected_paths))
+        self.assertIn("feature/test", result.stdout)
 
     def test_doctor_prefers_same_branch_and_explains_match(self) -> None:
         self.run_cli("init")
@@ -1478,6 +1599,329 @@ class AsmCliTests(unittest.TestCase):
         self.assertIn('"completed"', result.stdout)
         self.assertIn('"blockers"', result.stdout)
         self.assertIn('"next_actions"', result.stdout)
+
+    def test_import_codex_creates_session_from_transcript(self) -> None:
+        self.run_cli("init")
+        imported_workspace = Path(self.tmp.name) / "imported-workspace"
+        imported_workspace.mkdir()
+        session_file = self.write_codex_session(
+            "2026/06/11/rollout-2026-06-11T13-45-09-import-test.jsonl",
+            session_id="codex_import_session",
+            cwd=imported_workspace,
+            started_at="2026-06-11T05:45:09.595Z",
+            user_prompt="我想测试一下插件性能",
+            assistant_message="已确认 Codex transcript 可读，后续可以做 importer。",
+            updated_at="2026-06-11T05:45:56.660Z",
+        )
+
+        result = self.run_cli("import-codex")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["imported"], 1)
+        self.assertEqual(payload["created"], 1)
+        self.assertEqual(payload["updated"], 0)
+
+        with sqlite3.connect(self.home / "registry.db") as conn:
+            row = conn.execute(
+                """
+                SELECT agent, agent_session_ref, resume_command, path, project, branch, initial_prompt,
+                       latest_summary, latest_summary_source, status, session_file_path, imported_at
+                FROM sessions
+                WHERE agent = 'codex' AND agent_session_ref = ?
+                """,
+                ("codex_import_session",),
+            ).fetchone()
+        self.assertEqual(row[0], "codex")
+        self.assertEqual(row[1], "codex_import_session")
+        self.assertEqual(row[2], "codex resume codex_import_session")
+        self.assertEqual(row[3], str(imported_workspace))
+        self.assertEqual(row[4], "imported-workspace")
+        self.assertIsNone(row[5])
+        self.assertEqual(row[6], "我想测试一下插件性能")
+        self.assertEqual(row[7], "已确认 Codex transcript 可读，后续可以做 importer。")
+        self.assertIsNone(row[8])
+        self.assertEqual(row[9], "stopped")
+        self.assertEqual(row[10], str(session_file))
+        self.assertIsNotNone(row[11])
+
+    def test_import_codex_backfills_branch_for_historical_git_session(self) -> None:
+        self.run_cli("init")
+        imported_repo = Path(self.tmp.name) / "imported-git-repo"
+        self.init_git_repo(imported_repo, "feature/imported")
+        self.write_codex_session(
+            "2026/06/11/rollout-2026-06-11T13-45-59-import-branch.jsonl",
+            session_id="codex_import_branch",
+            cwd=imported_repo,
+            started_at="2026-06-11T05:45:59.595Z",
+            user_prompt="帮我验证 imported branch",
+            assistant_message="正在验证历史 transcript 的分支回填。",
+            updated_at="2026-06-11T05:46:16.660Z",
+        )
+
+        result = self.run_cli("import-codex")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        with sqlite3.connect(self.home / "registry.db") as conn:
+            row = conn.execute(
+                "SELECT project, branch FROM sessions WHERE agent = 'codex' AND agent_session_ref = ?",
+                ("codex_import_branch",),
+            ).fetchone()
+        self.assertEqual(row[0], "imported-git-repo")
+        self.assertEqual(row[1], "feature/imported")
+
+    def test_import_codex_does_not_override_agent_authored_semantics_or_summary(self) -> None:
+        self.run_cli("init")
+        start = self.run_cli("start", "--agent", "codex", "--agent-session-ref", "codex_import_existing")
+        session_id = start.stdout.strip()
+        payload = json.dumps(
+            {
+                "title": "Existing Agent Session",
+                "goal": "Keep agent-authored fields",
+                "summary": "agent-authored summary",
+                "completed": [],
+                "blockers": [],
+                "next_actions": [],
+            }
+        )
+        self.run_cli("checkpoint", "--session", session_id, "--payload", payload)
+
+        imported_workspace = Path(self.tmp.name) / "existing-imported-workspace"
+        imported_workspace.mkdir()
+        self.write_codex_session(
+            "2026/06/11/rollout-2026-06-11T13-46-09-import-existing.jsonl",
+            session_id="codex_import_existing",
+            cwd=imported_workspace,
+            started_at="2026-06-11T05:46:09.595Z",
+            user_prompt="这是导入时看到的第一句用户输入",
+            assistant_message="这是 transcript 里的 assistant summary，不应覆盖 agent summary。",
+            updated_at="2026-06-11T05:46:56.660Z",
+        )
+
+        result = self.run_cli("import-codex")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload_json = json.loads(result.stdout)
+        self.assertEqual(payload_json["updated"], 1)
+
+        with sqlite3.connect(self.home / "registry.db") as conn:
+            row = conn.execute(
+                """
+                SELECT title, goal, latest_summary, latest_summary_source, initial_prompt, session_file_path, imported_at, status
+                FROM sessions
+                WHERE id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+        self.assertEqual(row[0], "Existing Agent Session")
+        self.assertEqual(row[1], "Keep agent-authored fields")
+        self.assertEqual(row[2], "agent-authored summary")
+        self.assertEqual(row[3], "agent")
+        self.assertEqual(row[4], "这是导入时看到的第一句用户输入")
+        self.assertIn("import-existing.jsonl", row[5])
+        self.assertIsNotNone(row[6])
+        self.assertEqual(row[7], "stopped")
+
+    def test_ls_auto_syncs_codex_transcripts_without_manual_import(self) -> None:
+        self.run_cli("init")
+        imported_workspace = Path(self.tmp.name) / "auto-sync-workspace"
+        imported_workspace.mkdir()
+        self.write_codex_session(
+            "2026/06/11/rollout-2026-06-11T13-47-09-auto-sync.jsonl",
+            session_id="codex_auto_sync_session",
+            cwd=imported_workspace,
+            started_at="2026-06-11T05:47:09.595Z",
+            user_prompt="我想梳理 importer 方案",
+            assistant_message="已确认可以通过 Codex transcript 自动补录 session。",
+            updated_at="2026-06-11T05:47:56.660Z",
+        )
+
+        result = self.run_cli("ls", "--project", "auto-sync-workspace", "--long")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("我想梳理 importer 方案", result.stdout)
+        self.assertIn("codex resume codex_auto_sync_session", result.stdout)
+
+        with sqlite3.connect(self.home / "registry.db") as conn:
+            row = conn.execute(
+                "SELECT agent_session_ref, initial_prompt, latest_summary, status FROM sessions WHERE agent = 'codex' AND agent_session_ref = ?",
+                ("codex_auto_sync_session",),
+            ).fetchone()
+        self.assertEqual(row[0], "codex_auto_sync_session")
+        self.assertEqual(row[1], "我想梳理 importer 方案")
+        self.assertEqual(row[2], "已确认可以通过 Codex transcript 自动补录 session。")
+        self.assertEqual(row[3], "stopped")
+
+    def test_current_auto_sync_marks_matching_codex_thread_active(self) -> None:
+        self.run_cli("init")
+        imported_workspace = Path(self.tmp.name) / "current-auto-sync-workspace"
+        imported_workspace.mkdir()
+        self.write_codex_session(
+            "2026/06/11/rollout-2026-06-11T13-48-09-current-auto-sync.jsonl",
+            session_id="codex_current_auto_sync",
+            cwd=self.workspace,
+            started_at="2026-06-11T05:48:09.595Z",
+            user_prompt="请实现 import-codex 自动同步",
+            assistant_message="正在补自动同步能力。",
+            updated_at="2026-06-11T05:48:56.660Z",
+        )
+
+        env = self.env.copy()
+        env["CODEX_THREAD_ID"] = "codex_current_auto_sync"
+        result = subprocess.run(
+            [sys.executable, "-m", "asm.cli", "current", "--explain"],
+            cwd=str(self.workspace),
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("请实现 import-codex 自动同步", result.stdout)
+        self.assertIn("score 110", result.stdout)
+        self.assertIn("+50 same working directory", result.stdout)
+        self.assertIn("+30 same git root", result.stdout)
+        self.assertIn("+20 same branch", result.stdout)
+        self.assertIn("+10 active session", result.stdout)
+
+        with sqlite3.connect(self.home / "registry.db") as conn:
+            row = conn.execute(
+                "SELECT status, path FROM sessions WHERE agent = 'codex' AND agent_session_ref = ?",
+                ("codex_current_auto_sync",),
+            ).fetchone()
+        self.assertEqual(row[0], "active")
+        self.assertEqual(Path(row[1]).resolve(), self.workspace.resolve())
+
+    def test_checkpoint_current_can_write_to_auto_synced_codex_session_without_hooks(self) -> None:
+        self.run_cli("init")
+        self.write_codex_session(
+            "2026/06/11/rollout-2026-06-11T13-49-09-checkpoint-auto-sync.jsonl",
+            session_id="codex_checkpoint_auto_sync",
+            cwd=self.workspace,
+            started_at="2026-06-11T05:49:09.595Z",
+            user_prompt="请实现无 hook 的 checkpoint-current 路径",
+            assistant_message="正在验证 checkpoint-current 自动同步。",
+            updated_at="2026-06-11T05:49:56.660Z",
+        )
+
+        payload = json.dumps(
+            {
+                "title": "Hookless Checkpoint Current",
+                "goal": "Allow checkpoint-current after transcript auto-sync",
+                "summary": "checkpoint-current wrote through imported Codex session",
+                "completed": [],
+                "blockers": [],
+                "next_actions": ["verify stored summary"],
+            }
+        )
+        env = self.env.copy()
+        env["CODEX_THREAD_ID"] = "codex_checkpoint_auto_sync"
+        result = subprocess.run(
+            [sys.executable, "-m", "asm.cli", "checkpoint-current"],
+            cwd=str(self.workspace),
+            env=env,
+            text=True,
+            input=payload,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        with sqlite3.connect(self.home / "registry.db") as conn:
+            row = conn.execute(
+                """
+                SELECT title, goal, latest_summary, latest_summary_source, status
+                FROM sessions
+                WHERE agent = 'codex' AND agent_session_ref = ?
+                """,
+                ("codex_checkpoint_auto_sync",),
+            ).fetchone()
+        self.assertEqual(row[0], "Hookless Checkpoint Current")
+        self.assertEqual(row[1], "Allow checkpoint-current after transcript auto-sync")
+        self.assertEqual(row[2], "checkpoint-current wrote through imported Codex session")
+        self.assertEqual(row[3], "agent")
+        self.assertEqual(row[4], "active")
+
+    def test_finalize_current_can_stop_auto_synced_codex_session_without_hooks(self) -> None:
+        self.run_cli("init")
+        self.write_codex_session(
+            "2026/06/11/rollout-2026-06-11T13-50-09-finalize-auto-sync.jsonl",
+            session_id="codex_finalize_auto_sync",
+            cwd=self.workspace,
+            started_at="2026-06-11T05:50:09.595Z",
+            user_prompt="请实现无 hook 的 finalize-current 路径",
+            assistant_message="正在验证 finalize-current 自动同步。",
+            updated_at="2026-06-11T05:50:56.660Z",
+        )
+
+        checkpoint_payload = json.dumps(
+            {
+                "title": "Hookless Finalize Current",
+                "goal": "Prepare imported session for finalize-current",
+                "summary": "checkpoint before hookless finalize",
+                "completed": [],
+                "blockers": [],
+                "next_actions": ["finalize imported session"],
+            }
+        )
+        env = self.env.copy()
+        env["CODEX_THREAD_ID"] = "codex_finalize_auto_sync"
+        checkpoint_result = subprocess.run(
+            [sys.executable, "-m", "asm.cli", "checkpoint-current"],
+            cwd=str(self.workspace),
+            env=env,
+            text=True,
+            input=checkpoint_payload,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(checkpoint_result.returncode, 0, checkpoint_result.stderr)
+
+        final_payload = json.dumps(
+            {
+                "summary": "finalized through hookless imported session",
+                "completed": ["stored final agent-authored summary"],
+                "blockers": [],
+                "next_actions": ["resume later if needed"],
+            }
+        )
+        finalize_result = subprocess.run(
+            [sys.executable, "-m", "asm.cli", "finalize-current"],
+            cwd=str(self.workspace),
+            env=env,
+            text=True,
+            input=final_payload,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(finalize_result.returncode, 0, finalize_result.stderr)
+
+        with sqlite3.connect(self.home / "registry.db") as conn:
+            row = conn.execute(
+                """
+                SELECT status, latest_summary, latest_summary_source, ended_at
+                FROM sessions
+                WHERE agent = 'codex' AND agent_session_ref = ?
+                """,
+                ("codex_finalize_auto_sync",),
+            ).fetchone()
+            checkpoint_rows = conn.execute(
+                """
+                SELECT kind, source, summary
+                FROM checkpoints
+                WHERE session_id = (SELECT id FROM sessions WHERE agent = 'codex' AND agent_session_ref = ?)
+                ORDER BY created_at ASC
+                """,
+                ("codex_finalize_auto_sync",),
+            ).fetchall()
+        self.assertEqual(row[0], "stopped")
+        self.assertEqual(row[1], "finalized through hookless imported session")
+        self.assertEqual(row[2], "agent")
+        self.assertIsNotNone(row[3])
+        self.assertEqual(
+            checkpoint_rows,
+            [
+                ("progress", "agent", "checkpoint before hookless finalize"),
+                ("final", "agent", "finalized through hookless imported session"),
+            ],
+        )
 
     def test_readme_uses_finalize_current_as_standard_shutdown_flow(self) -> None:
         readme = (ROOT / "README.md").read_text()

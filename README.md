@@ -29,6 +29,19 @@ Then use the installed entrypoint:
 .venv/bin/asm ls
 ```
 
+If you want a global `asm` command on your `PATH`, add a small wrapper under a user bin directory that already exists in `PATH`, for example `~/.local/bin/asm`, and point it at the ASM virtual environment:
+
+```bash
+#!/bin/sh
+exec /path/to/agent-session-manager/.venv/bin/python -m asm.cli "$@"
+```
+
+ASM runtime data is global by default:
+
+- registry database: `~/.asm/registry.db`
+- Codex prompts/hooks: `~/.codex/`
+- CLI wrapper: any directory on your shell `PATH`, for example `~/.local/bin`
+
 ## MVP Commands
 
 - `asm init`
@@ -43,6 +56,7 @@ Then use the installed entrypoint:
 - `asm search`
 - `asm doctor`
 - `asm current`
+- `asm import-codex`
 - `asm checkpoint-template`
 - `asm checkpoint-prompt`
 
@@ -189,6 +203,31 @@ List recent sessions globally:
 ./asm ls
 ```
 
+Backfill sessions directly from native Codex transcript files:
+
+```bash
+./asm import-codex
+./asm import-codex --limit 50
+./asm import-codex --codex-home ~/.codex
+```
+
+For Codex-focused workflows, query commands also perform a conservative automatic transcript sync before reading ASM results:
+
+```bash
+./asm ls
+./asm search "importer"
+./asm current --explain
+./asm doctor
+```
+
+Write-through commands also auto-sync before selecting the current Codex session:
+
+```bash
+./asm checkpoint-current
+./asm finalize-current
+./asm stop-current
+```
+
 Filter by status, branch, or agent:
 
 ```bash
@@ -198,6 +237,21 @@ Filter by status, branch, or agent:
 ./asm ls --project my-project
 ./asm ls --agent codex
 ```
+
+Choose how `scope` is displayed:
+
+```bash
+./asm ls --scope project
+./asm ls --scope path
+./asm current --scope path
+./asm doctor --scope path
+./asm search "knowledge_preprocess" --scope path
+```
+
+Examples:
+
+- `--scope project`: `knowledge_preprocess @ fix/doc_line_break`
+- `--scope path`: `/Users/bytedance/Data/Code/PythonProject/knowledge_preprocess @ fix/doc_line_break`
 
 Search by free-text keyword:
 
@@ -218,6 +272,50 @@ Notes:
 
 - default `asm ls` is intentionally compact for fast scanning
 - `asm ls --long` may truncate long `goal` and `last` fields for readability
+- `asm search` is keyword contains-match across `title`, `initial_prompt`, `goal`, `latest_summary`, `project`, `branch`, and `path`
+
+## Codex Alignment Without Full Hook Dependence
+
+ASM can now import native Codex session files from `~/.codex/sessions/**/*.jsonl`.
+
+What the importer can reliably recover:
+
+- Codex session id
+- working directory (`cwd`)
+- session start timestamp
+- latest transcript timestamp
+- first user message as `initial_prompt`
+- last assistant message as a low-priority fallback summary
+
+What the importer should not be trusted to recover as a stable interface:
+
+- git branch at session start
+- explicit lifecycle events equivalent to official hooks
+- stable transcript semantics across Codex releases
+
+Because Codex documents transcript paths as convenience data rather than a stable hook interface, the recommended model is hybrid:
+
+- use hooks for stable realtime capture
+- use `asm import-codex` for backfill, reconciliation, and lower-touch auto-collection
+
+Current practical behavior:
+
+- `asm init` still installs Codex hooks by default
+- hooks are no longer required for ASM to be useful with Codex
+- if hooks are missing, ASM can still auto-sync from native Codex transcripts and support `ls`, `search`, `current`, `doctor`, `checkpoint-current`, `finalize-current`, and `stop-current`
+- hooks remain the higher-quality path for realtime lifecycle capture and structured summaries
+
+Import behavior is conservative by design:
+
+- imported sessions use the native Codex session id as `agent_session_ref`
+- imported sessions get `resume_command = codex resume <session_id>`
+- imported metadata fills missing ASM fields only
+- imported transcript summaries do not overwrite agent-authored checkpoint summaries
+- imported session provenance is stored via transcript path metadata, not by pretending imports are agent checkpoints
+- `ls`, `search`, `current`, `doctor`, `checkpoint-current`, `finalize-current`, and `stop-current` auto-sync recent Codex transcript files before matching sessions
+- if the imported transcript session id matches the current `CODEX_THREAD_ID`, ASM marks that imported session as `active` and aligns it with the current shell context
+- imported historical sessions now also attempt to backfill `branch` from the transcript working directory when that directory is still a live git worktree
+- this means `checkpoint-current` and `finalize-current` can operate on the current Codex session even when no Codex hooks were installed, as long as the native transcript exists
 - listings use absolute timestamps in `YYYY-MM-DD HH:MM` format
 
 Explain why `doctor` recommended a session:

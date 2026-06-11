@@ -31,6 +31,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     branch TEXT,
     hostname TEXT,
     tmux_session TEXT,
+    session_file_path TEXT,
+    session_file_mtime_ns INTEGER,
+    imported_at TEXT,
     status TEXT NOT NULL CHECK(status IN ('active', 'stopped')),
     started_at TEXT NOT NULL,
     ended_at TEXT,
@@ -60,6 +63,7 @@ class DoctorMatch:
     title: str | None
     initial_prompt: str | None
     project: str | None
+    path: str | None
     branch: str | None
     status: str
     latest_summary: str | None
@@ -102,6 +106,12 @@ class Registry:
             conn.execute("ALTER TABLE sessions ADD COLUMN initial_prompt TEXT")
         if "latest_summary_source" not in session_columns:
             conn.execute("ALTER TABLE sessions ADD COLUMN latest_summary_source TEXT")
+        if "session_file_path" not in session_columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN session_file_path TEXT")
+        if "session_file_mtime_ns" not in session_columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN session_file_mtime_ns INTEGER")
+        if "imported_at" not in session_columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN imported_at TEXT")
 
         checkpoint_columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(checkpoints)").fetchall()
@@ -145,9 +155,9 @@ class Registry:
                 """
                 INSERT INTO sessions (
                     id, agent, agent_session_ref, resume_command, title, initial_prompt, goal, latest_summary, clarification_requested, path,
-                    git_root, project, branch, hostname, tmux_session, status, started_at, ended_at, updated_at
+                    git_root, project, branch, hostname, tmux_session, session_file_path, session_file_mtime_ns, imported_at, status, started_at, ended_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, ?, ?, ?, ?, ?, ?, 'active', ?, NULL, ?)
+                VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'active', ?, NULL, ?)
                 """,
                 (
                     session_id,
@@ -358,7 +368,7 @@ class Registry:
             rows = conn.execute(
                 f"""
                 SELECT id, agent, agent_session_ref, resume_command, title, initial_prompt, goal, project, branch, status,
-                       updated_at, latest_summary, latest_summary_source
+                       updated_at, latest_summary, latest_summary_source, path
                 FROM sessions
                 {where_sql}
                 ORDER BY updated_at DESC
@@ -413,7 +423,7 @@ class Registry:
             rows = conn.execute(
                 f"""
                 SELECT id, agent, agent_session_ref, resume_command, title, initial_prompt, goal, project, branch, status,
-                       updated_at, latest_summary, latest_summary_source
+                       updated_at, latest_summary, latest_summary_source, path
                 FROM sessions
                 {where_sql}
                 ORDER BY updated_at DESC
@@ -463,6 +473,7 @@ class Registry:
                     title=row["title"],
                     initial_prompt=row["initial_prompt"],
                     project=row["project"],
+                    path=row["path"],
                     branch=row["branch"],
                     status=row["status"],
                     latest_summary=row["latest_summary"],
@@ -491,3 +502,123 @@ class Registry:
                 (session_id,),
             ).fetchone()
         return int(row["count"]) > 0
+
+    def imported_codex_file_mtimes(self) -> dict[str, int]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT session_file_path, session_file_mtime_ns
+                FROM sessions
+                WHERE agent = 'codex' AND session_file_path IS NOT NULL AND session_file_mtime_ns IS NOT NULL
+                """
+            ).fetchall()
+        return {
+            str(row["session_file_path"]): int(row["session_file_mtime_ns"])
+            for row in rows
+            if row["session_file_path"] is not None and row["session_file_mtime_ns"] is not None
+        }
+
+    def import_codex_session(
+        self,
+        *,
+        agent_session_ref: str,
+        path: str,
+        git_root: str | None,
+        project: str | None,
+        branch: str | None,
+        started_at: str,
+        updated_at: str,
+        initial_prompt: str | None,
+        latest_summary: str | None,
+        session_file_path: str,
+        session_file_mtime_ns: int,
+        status: str,
+    ) -> tuple[str, str]:
+        now = utc_now()
+        resume_command = f"codex resume {agent_session_ref}"
+        with self.connect() as conn:
+            existing = conn.execute(
+                "SELECT * FROM sessions WHERE agent = ? AND agent_session_ref = ?",
+                ("codex", agent_session_ref),
+            ).fetchone()
+            if existing:
+                latest_summary_value = existing["latest_summary"]
+                latest_summary_source = existing["latest_summary_source"]
+                if not latest_summary_value and latest_summary:
+                    latest_summary_value = latest_summary
+
+                conn.execute(
+                    """
+                    UPDATE sessions
+                    SET resume_command = ?,
+                        path = COALESCE(path, ?),
+                        git_root = COALESCE(git_root, ?),
+                        project = COALESCE(project, ?),
+                        branch = COALESCE(branch, ?),
+                        initial_prompt = COALESCE(initial_prompt, ?),
+                        latest_summary = ?,
+                        latest_summary_source = ?,
+                        session_file_path = COALESCE(session_file_path, ?),
+                        session_file_mtime_ns = ?,
+                        imported_at = ?,
+                        status = ?,
+                        started_at = CASE
+                            WHEN started_at IS NULL OR started_at = '' THEN ?
+                            ELSE started_at
+                        END,
+                        updated_at = CASE
+                            WHEN updated_at >= ? THEN updated_at
+                            ELSE ?
+                        END
+                    WHERE id = ?
+                    """,
+                    (
+                        resume_command,
+                        path,
+                        git_root,
+                        project,
+                        branch,
+                        initial_prompt,
+                        latest_summary_value,
+                        latest_summary_source,
+                        session_file_path,
+                        session_file_mtime_ns,
+                        now,
+                        status,
+                        started_at,
+                        updated_at,
+                        updated_at,
+                        existing["id"],
+                    ),
+                )
+                return str(existing["id"]), "updated"
+
+            session_id = f"asm_{uuid.uuid4().hex[:12]}"
+            conn.execute(
+                """
+                INSERT INTO sessions (
+                    id, agent, agent_session_ref, resume_command, title, initial_prompt, goal, latest_summary, latest_summary_source,
+                    clarification_requested, path, git_root, project, branch, hostname, tmux_session, session_file_path, session_file_mtime_ns, imported_at,
+                    status, started_at, ended_at, updated_at
+                )
+                VALUES (?, 'codex', ?, ?, NULL, ?, NULL, ?, NULL, 0, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, NULL, ?)
+                """,
+                (
+                    session_id,
+                    agent_session_ref,
+                    resume_command,
+                    initial_prompt,
+                    latest_summary,
+                    path,
+                    git_root,
+                    project,
+                    branch,
+                    session_file_path,
+                    session_file_mtime_ns,
+                    now,
+                    status,
+                    started_at,
+                    updated_at,
+                ),
+            )
+            return session_id, "created"
