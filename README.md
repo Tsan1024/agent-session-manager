@@ -2,6 +2,18 @@
 
 Agent Session Manager (ASM) is a local-first registry for agent sessions. It records Codex session metadata, stores structured checkpoints, and helps identify the correct session to resume later.
 
+## Why ASM Exists
+
+Modern agent workflows are fragmented across multiple terminals, projects, branches, and tools. A few hours later, you often remember the work itself, but not which agent session it belonged to.
+
+Native agent history is usually local to one tool and too weak for global recovery. ASM exists to solve that recovery problem with a tool-agnostic, local-first registry:
+
+- it records the minimal metadata needed to find the right session again
+- it keeps optional structured summaries when the agent can provide them
+- it does not replace native agent resume flows; it points you back to them
+
+The design goal is simple: when you have several Codex, Claude, or other agent sessions in flight, ASM should help you answer "which session should I resume?" without reopening every agent first.
+
 ## Installation
 
 Create a local virtual environment and install ASM in editable mode:
